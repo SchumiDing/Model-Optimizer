@@ -21,7 +21,7 @@ import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -1841,6 +1841,20 @@ def svdquant(
     max_calibrate(model, forward_loop)
 
 
+def _reset_layerwise_replay_cache(kwargs_input: dict[str, Any]) -> dict[str, Any]:
+    """Reset mutable KV-cache state before replaying one captured layer input."""
+    if "past_key_values" not in kwargs_input or kwargs_input["past_key_values"] is None:
+        return kwargs_input
+
+    replay_kwargs = dict(kwargs_input)
+    cache = replay_kwargs["past_key_values"]
+    if hasattr(cache, "reset"):
+        cache.reset()
+    else:
+        replay_kwargs["past_key_values"] = None
+    return replay_kwargs
+
+
 @torch.no_grad()
 def layerwise_calibrate(
     model: nn.Module,
@@ -1903,25 +1917,27 @@ def layerwise_calibrate(
 
         for layer_idx in range(start_layer, num_layers):
             layer = transformer_layers[layer_idx]
+            if layer_inputs is None:
+                raise RuntimeError(
+                    f"Missing captured inputs for transformer layer {layer_idx}."
+                )
+            next_inputs = None
 
             def _layer_forward_loop(m, _inputs=layer_inputs):
                 for args, kwargs_input in _inputs:
-                    # Reset past_key_values to prevent the KV cache from
-                    # accumulating across multiple forward replays (e.g.
-                    # max_calibrate then Hessian collection in GPTQ).
-                    # The layer doesn't need stale KV data — each replay
-                    # should start with a fresh cache.
-                    if (
-                        "past_key_values" in kwargs_input
-                        and kwargs_input["past_key_values"] is not None
-                    ):
-                        kwargs_input = dict(kwargs_input)
-                        cache = kwargs_input["past_key_values"]
-                        if hasattr(cache, "reset"):
-                            cache.reset()
-                        else:
-                            kwargs_input["past_key_values"] = None
-                    m(*args, **kwargs_input)
+                    replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
+                    m(*args, **replay_kwargs)
+
+            def _replay_batch(m, batch_index: int, _inputs=layer_inputs):
+                args, kwargs_input = _inputs[batch_index]
+                replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
+                m(*args, **replay_kwargs)
+
+            # Custom algorithms such as GPTAQ can pair two replays of one batch
+            # without retaining the full calibration set's intermediate inputs.
+            # Attributes preserve the ordinary ForwardLoop callable contract.
+            setattr(_layer_forward_loop, "replay_batch", _replay_batch)
+            setattr(_layer_forward_loop, "num_batches", len(layer_inputs))
 
             is_last = layer_idx + 1 >= num_layers
 
