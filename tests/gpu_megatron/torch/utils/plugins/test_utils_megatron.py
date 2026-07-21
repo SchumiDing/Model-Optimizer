@@ -14,13 +14,36 @@
 # limitations under the License.
 
 import pytest
+import torch
 from _test_utils.torch.megatron.models import get_mcore_qwen3_600m
 from _test_utils.torch.megatron.utils import initialize_for_megatron
 from transformers import AutoTokenizer
 
+from modelopt.torch.quantization.utils.layerwise_calib import LayerActivationCollector
 from modelopt.torch.utils.plugins import megatron_generate, megatron_mmlu
+from modelopt.torch.utils.plugins.megatron_generate import (
+    _is_layerwise_capture_active,
+    megatron_prefill,
+)
 
 SEED = 1234
+
+
+class _LayerwiseState:
+    def __init__(self, mode):
+        self.mode = mode
+
+
+def test_is_layerwise_capture_active():
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.ReLU())
+    assert not _is_layerwise_capture_active(model)
+
+    model[0]._layerwise_calib = _LayerwiseState("original")
+    assert not _is_layerwise_capture_active(model)
+
+    model[1]._layerwise_calib = _LayerwiseState("capture")
+    assert _is_layerwise_capture_active(model)
+
 
 # TODO: move to regression test folder
 
@@ -60,6 +83,60 @@ def _test_megatron_generate_and_mmlu(rank, size, parallelism):
         print(rank, output_text)
 
     assert 0.36 < megatron_mmlu(model, tokenizer, fraction=0.1, batch_size=16) < 0.39
+
+
+def _test_layerwise_megatron_prefill(rank, size):
+    initialize_for_megatron(tensor_model_parallel_size=size, seed=SEED)
+    model = get_mcore_qwen3_600m(tensor_model_parallel_size=size).cuda().eval()
+    collector = LayerActivationCollector(model)
+    decoder_layers = collector.get_decoder_layers(model)
+    assert decoder_layers is not None
+
+    collector._patch_all_layers(decoder_layers)
+    try:
+        input_ids = torch.randint(0, model.vocab_size, (1, 8), device="cuda")
+        layer_inputs = collector.get_first_layer_inputs(
+            start_layer=0,
+            resumed_inputs=None,
+            forward_loop=lambda patched_model: megatron_prefill(
+                patched_model, input_ids, skip_return_logits=True
+            ),
+        )
+        assert len(layer_inputs) == 1
+    finally:
+        collector._unpatch_all_layers()
+
+
+def _test_layerwise_megatron_prefill_pp_rejected(rank, size):
+    initialize_for_megatron(pipeline_model_parallel_size=size, seed=SEED)
+    model = get_mcore_qwen3_600m(pipeline_model_parallel_size=size).cuda().eval()
+    collector = LayerActivationCollector(model)
+    decoder_layers = collector.get_decoder_layers(model)
+    assert decoder_layers is not None
+
+    collector._patch_all_layers(decoder_layers)
+    try:
+        input_ids = torch.randint(0, model.vocab_size, (1, 8), device="cuda")
+        with pytest.raises(RuntimeError, match="pipeline_model_parallel_size=1"):
+            collector.get_first_layer_inputs(
+                start_layer=0,
+                resumed_inputs=None,
+                forward_loop=lambda patched_model: megatron_prefill(
+                    patched_model, input_ids, skip_return_logits=True
+                ),
+            )
+    finally:
+        collector._unpatch_all_layers()
+
+
+def test_layerwise_megatron_prefill(dist_workers):
+    dist_workers.run(_test_layerwise_megatron_prefill)
+
+
+def test_layerwise_megatron_prefill_pp_rejected(dist_workers, num_gpus):
+    if num_gpus == 1:
+        pytest.skip("Pipeline-parallel rejection requires at least 2 GPUs")
+    dist_workers.run(_test_layerwise_megatron_prefill_pp_rejected)
 
 
 @pytest.mark.parametrize("parallelism", ["tp", "pp", "cp", "dp"])

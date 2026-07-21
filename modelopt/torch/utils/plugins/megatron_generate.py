@@ -101,6 +101,14 @@ def get_current_memory_info():
     return info
 
 
+def _is_layerwise_capture_active(model: MegatronModule) -> bool:
+    """Return whether ModelOpt layerwise calibration is capturing a decoder layer."""
+    return any(
+        getattr(getattr(module, "_layerwise_calib", None), "mode", None) == "capture"
+        for module in model.modules()
+    )
+
+
 @torch.no_grad()
 def megatron_prefill(
     model: MegatronModule,
@@ -110,7 +118,7 @@ def megatron_prefill(
     image_sizes: torch.LongTensor | None = None,
     position_ids: torch.LongTensor | None = None,
     skip_return_logits: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """A simple prefill function for Megatron Core V(LM) models.
 
     Supports TP, PP, SP, CP, EP, and combinations thereof. For PP, activations are communicated
@@ -137,6 +145,16 @@ def megatron_prefill(
     pp_dtype = model.config.pipeline_dtype or (
         torch.bfloat16 if model.config.bf16 else torch.float32
     )
+
+    # Layerwise calibration intentionally returns None after capturing the target
+    # layer. That early-stop is safe without PP, but under PP it would prevent an
+    # upstream stage from sending activations while downstream stages wait in recv.
+    if is_pp and skip_return_logits and _is_layerwise_capture_active(model):
+        raise RuntimeError(
+            "Layerwise Megatron calibration with pipeline parallelism is not supported: "
+            "the capture early-stop would break pipeline send/recv synchronization. "
+            "Run calibration with pipeline_model_parallel_size=1."
+        )
 
     if model.config.sequence_parallel:
         tp = model.config.tensor_model_parallel_size
@@ -224,6 +242,18 @@ def megatron_prefill(
         output = model(**forward_kwargs)
     else:
         output = model(tokens, position_ids, attention_mask, runtime_gather_output=True)
+
+    # During layerwise capture the model-level patch deliberately converts the
+    # internal early-stop exception into None. A logits-free caller must accept
+    # that result instead of indexing it. PP capture is rejected before recv/send
+    # setup above, so returning here cannot strand another pipeline stage.
+    if output is None:
+        if skip_return_logits and not is_pp and _is_layerwise_capture_active(model):
+            return None
+        raise RuntimeError(
+            "Megatron prefill returned None outside a supported non-pipeline "
+            "layerwise calibration capture."
+        )
 
     # Some VLM wrappers (e.g. Gemma3VLModel) return ``(logits, loss_mask)`` rather than a bare tensor.
     if isinstance(output, (tuple, list)):
