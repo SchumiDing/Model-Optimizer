@@ -1855,6 +1855,24 @@ def _reset_layerwise_replay_cache(kwargs_input: dict[str, Any]) -> dict[str, Any
     return replay_kwargs
 
 
+class _LayerwiseReplayLoop:
+    """Replay captured inputs for one decoder layer, jointly or one batch at a time."""
+
+    def __init__(self, inputs: list[tuple[tuple[Any, ...], dict[str, Any]]]):
+        self._inputs = inputs
+        self.num_batches = len(inputs)
+
+    def __call__(self, module: nn.Module) -> None:
+        for args, kwargs_input in self._inputs:
+            replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
+            module(*args, **replay_kwargs)
+
+    def replay_batch(self, module: nn.Module, batch_index: int) -> None:
+        args, kwargs_input = self._inputs[batch_index]
+        replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
+        module(*args, **replay_kwargs)
+
+
 @torch.no_grad()
 def layerwise_calibrate(
     model: nn.Module,
@@ -1922,22 +1940,7 @@ def layerwise_calibrate(
                     f"Missing captured inputs for transformer layer {layer_idx}."
                 )
             next_inputs = None
-
-            def _layer_forward_loop(m, _inputs=layer_inputs):
-                for args, kwargs_input in _inputs:
-                    replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
-                    m(*args, **replay_kwargs)
-
-            def _replay_batch(m, batch_index: int, _inputs=layer_inputs):
-                args, kwargs_input = _inputs[batch_index]
-                replay_kwargs = _reset_layerwise_replay_cache(kwargs_input)
-                m(*args, **replay_kwargs)
-
-            # Custom algorithms such as GPTAQ can pair two replays of one batch
-            # without retaining the full calibration set's intermediate inputs.
-            # Attributes preserve the ordinary ForwardLoop callable contract.
-            setattr(_layer_forward_loop, "replay_batch", _replay_batch)
-            setattr(_layer_forward_loop, "num_batches", len(layer_inputs))
+            layer_forward_loop = _LayerwiseReplayLoop(layer_inputs)
 
             is_last = layer_idx + 1 >= num_layers
 
@@ -1957,7 +1960,7 @@ def layerwise_calibrate(
                     # deque; reset so calib_func's replay hits the real forward.
                     layer._layerwise_calib.mode = "original"
 
-                calib_func(layer, _layer_forward_loop, **calib_kwargs)
+                calib_func(layer, layer_forward_loop, **calib_kwargs)
 
                 # qdq_from_prev=True: capture after calib_func so the next layer
                 # sees QDQ error and any in-place weight updates from this layer.
