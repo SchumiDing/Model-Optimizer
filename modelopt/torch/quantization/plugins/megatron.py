@@ -344,10 +344,14 @@ class _MegatronParallelLinear(_ParallelLinear):
     def _process_quantizer_amax(self, k, v, quantizer_state_dict):
         if v.ndim == 4:
             quantizer_state_dict[k] = v.squeeze(1).squeeze(-1)
+        elif v.numel() > 1:
+            out_dim = self.weight.shape[0]
+            if v.numel() % out_dim == 0:
+                quantizer_state_dict[k] = v.view(out_dim, -1)
+            else:
+                quantizer_state_dict[k] = v.reshape(v.shape[0], -1) if v.ndim >= 2 else v.view(-1)
         else:
-            quantizer_state_dict[k] = (
-                v.view(self.weight.shape[0], -1) if v.numel() > 1 else v.view(-1)
-            )
+            quantizer_state_dict[k] = v.view(-1)
 
     def _process_activation_quantizer_pre_quant_scale(self, k, v, quantizer_state_dict):
         quantizer_state_dict[k] = v
@@ -685,6 +689,21 @@ if HAS_TE:
     # Quantized subclasses to support TEGroupedMLP quantization
     class _QuantMegatronTEGroupedLinear(_QuantTEGroupedLinear, _MegatronParallelLinear):
         def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+            # Fold per-expert static-block-amax shards emitted by sharded_state_dict back into
+            # the single shared quantizer buffer. Every "<key>._amax.gemmN" entry is a bit-exact
+            # copy of the same shared amax, so we keep one and drop the rest (no value change).
+            import re as _re
+
+            gemm_shards = {}
+            for k in list(state_dict.keys()):
+                m = _re.search(r"(.*\._amax)\.gemm\d+$", k)
+                if m:
+                    gemm_shards.setdefault(m.group(1), []).append(k)
+            for base_key, shard_keys in gemm_shards.items():
+                if base_key not in state_dict:
+                    state_dict[base_key] = state_dict[shard_keys[0]]
+                for k in shard_keys:
+                    del state_dict[k]
             # _sharded_state_dict_grouped adds _extra_state{gemm_idx} for gemm_idx:[1, num_gemms] in
             # sharded_state_dict which is same as _extra_state. The _extra_state{gemm_idx} is used for
             # TE Fp8 checkpoint, we need to remove the _extra_state{gemm_idx} for gemm_idx:[1, num_gemms]
@@ -697,8 +716,75 @@ if HAS_TE:
             return super()._load_from_state_dict(filtered_state_dict, prefix, *args, **kwargs)
 
         def _process_quantizer_amax(self, k, v, quantizer_state_dict):
-            assert v.numel() == 1, "TEGroupedLinear only supports per-tensor quantization"
-            quantizer_state_dict[k] = v.view(-1)
+            # Per-tensor amax (numel==1, e.g. dynamic-NVFP4 global scale or FP8) keeps the
+            # native replicated path. Static per-block amax (numel>1, FP-Quant/MR-GPTQ) is a
+            # single tensor shared across this rank's local experts but *differs across EP
+            # ranks*; it cannot be stored replicated (EP-merged namespace would collide).
+            # Stash it here and emit per-expert (EP-identified) shards in sharded_state_dict.
+            if v.numel() == 1:
+                quantizer_state_dict[k] = v.view(-1)
+            else:
+                self._grouped_block_amax_pending[k] = v
+
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+            from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+            from megatron.core.utils import get_pg_rank, get_pg_size
+
+            # Collect static per-block amax stashed by _process_quantizer_amax during super().
+            self._grouped_block_amax_pending = {}
+            sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+            pending = self._grouped_block_amax_pending
+            self._grouped_block_amax_pending = {}
+            if not pending:
+                return sharded_state_dict
+
+            # Give the per-rank shared block amax a unique global identity per local expert,
+            # mirroring how TEGroupedLinear stores weight{i} (singleton_local_shards / ep_axis).
+            # The amax buffer is shared across a rank's local experts, so every emitted expert
+            # shard is backed by the same buffer; on distcp load each global-expert key fills
+            # the shared buffer with the identical value. Preserves quantization math/bits.
+            meta = ensure_metadata_has_dp_cp_group(metadata)
+            singleton = bool((metadata or {}).get("singleton_local_shards", False))
+            ep_group = self._pg_collection.ep
+            num_gemms = self.num_gemms
+            num_global_experts = get_pg_size(ep_group) * num_gemms
+            local_expert_indices_offset = get_pg_rank(ep_group) * num_gemms
+            ep_axis = len(sharded_offsets)
+            # Expert tensors are replicated across the *expert* data-parallel group (each expert
+            # is owned by a single EP rank), so the owning rank must be the main replica. Use the
+            # expert dp/tp groups from the module's parallel_state, mirroring how weight{i} shards.
+            dp_cp_group = meta["dp_cp_group"]
+            tp_group = self._tp_group
+            pstate = getattr(self, "parallel_state", None)
+            if pstate is not None:
+                if getattr(pstate, "data_parallel_group", None) is not None:
+                    dp_cp_group = pstate.data_parallel_group.group
+                if getattr(pstate, "tensor_parallel_group", None) is not None:
+                    tp_group = pstate.tensor_parallel_group.group
+            for k, v in pending.items():
+                for gemm_idx in range(num_gemms):
+                    global_expert_idx = local_expert_indices_offset + gemm_idx
+                    state = {f"{gemm_idx}.{k}": v}
+                    if singleton:
+                        expert_prefix = f"{global_expert_idx}.{prefix}"
+                        new_sharded_offsets = sharded_offsets
+                    else:
+                        expert_prefix = prefix
+                        new_sharded_offsets = (
+                            *sharded_offsets,
+                            (ep_axis, global_expert_idx, num_global_experts),
+                        )
+                    sub = make_sharded_tensors_for_checkpoint(
+                        state,
+                        "",
+                        {},
+                        new_sharded_offsets,
+                        tp_group=tp_group,
+                        dp_cp_group=dp_cp_group,
+                    )
+                    replace_prefix_for_sharding(sub, f"{gemm_idx}.", expert_prefix)
+                    sharded_state_dict[f"{prefix}{k}.gemm{gemm_idx}"] = sub[f"{gemm_idx}.{k}"]
+            return sharded_state_dict
 
     @QuantModuleRegistry.register(
         {TEColumnParallelGroupedLinear: "megatron_TEColumnParallelGroupedLinear"}
