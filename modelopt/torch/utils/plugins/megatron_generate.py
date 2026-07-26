@@ -236,6 +236,14 @@ def megatron_prefill(
         )
         send_to_next_pipeline_rank(output.to(dtype=pp_dtype))
 
+    # Layerwise calibration short-circuits model.forward() to return None after
+    # capturing the target layer's inputs; the caller only needs the forward
+    # side effects, not logits. Honor skip_return_logits BEFORE indexing output
+    # so a None (short-circuited) output does not raise. All ranks pass the same
+    # flag, so skipping the broadcast below stays collectively consistent.
+    if skip_return_logits:
+        return None
+
     # .contiguous() is required because the slice is a view with the padded stride; the broadcast
     # below asserts contiguity when SP pads seq_length up to a multiple of TP.
     logits = output[:, :seq_length, :].detach().contiguous() if pp_last else None
