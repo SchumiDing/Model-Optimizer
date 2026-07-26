@@ -137,8 +137,10 @@ class _QuantTEGroupedLinear(_ParallelLinear):
         # Remove self.weight after setup.
         delattr(self, "weight")
 
-        # TODO: GroupedLinear supports weights split by `num_gemms`, to support quantization
-        # with static parameters beyond per-tensor, we need to support a unique quantizer for each gemm.
+        # Per-expert static scales beyond per-tensor are supported via the
+        # project per-expert scale container (`_grouped_expert_scale_state_v1`),
+        # applied per gemm in `te_grouped_quantized_linear_fn` and persisted as a
+        # stacked buffer through the Megatron distcp hooks.
 
     def modelopt_post_restore(self, prefix: str = ""):
         # GroupedMLP stores the weights as weight0, weight1, etc. To run post_restore in order to
@@ -184,8 +186,27 @@ class _QuantTEGroupedLinear(_ParallelLinear):
 
         new_args = list(args)
         new_args[inp_pos] = self.input_quantizer(args[inp_pos])
-        for i in range(weights_start, weights_start + num_gemms):
-            new_args[i] = self.weight_quantizer(args[i])
+        # Per-expert scale isolation: if a per-expert scale container is present
+        # (MoE grouped linear), quantize each weight{i} with ITS OWN scale rather
+        # than a single shared scale. Falls back to the shared quantizer otherwise.
+        state = getattr(self, "_grouped_expert_scale_state_v1", None)
+        if state is None:
+            for i in range(weights_start, weights_start + num_gemms):
+                new_args[i] = self.weight_quantizer(args[i])
+        else:
+            from quant.methods.expert_scale_state import (
+                snapshot_quantizer_scale_state,
+                restore_quantizer_scale_state,
+                fake_quant_expert_weight,
+            )
+
+            q = self.weight_quantizer
+            snap = snapshot_quantizer_scale_state(q)
+            try:
+                for j, i in enumerate(range(weights_start, weights_start + num_gemms)):
+                    new_args[i] = fake_quant_expert_weight(q, args[i], state.experts[j], state.format)
+            finally:
+                restore_quantizer_scale_state(q, snap)
         output = getattr(package, func_name)(*new_args)
         # TE 2.15+ returns `(out, new_workspaces)`; TE <= 2.14 returns just `out`.
         # Only the activation tensor participates in output quantization.

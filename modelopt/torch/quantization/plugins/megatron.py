@@ -689,21 +689,41 @@ if HAS_TE:
     # Quantized subclasses to support TEGroupedMLP quantization
     class _QuantMegatronTEGroupedLinear(_QuantTEGroupedLinear, _MegatronParallelLinear):
         def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-            # Fold per-expert static-block-amax shards emitted by sharded_state_dict back into
-            # the single shared quantizer buffer. Every "<key>._amax.gemmN" entry is a bit-exact
-            # copy of the same shared amax, so we keep one and drop the rest (no value change).
+            # Per-expert static-block-amax shards emitted by sharded_state_dict are
+            # "<key>._amax.gemmN". Under per-expert scale isolation these values DIFFER
+            # across experts, so we (1) rebuild the per-expert scale container
+            # (`_grouped_expert_scale_state_v1`) from all gemm shards, and (2) keep gemm0
+            # in the single shared quantizer buffer as a runtime compute seed. Per-expert
+            # NVFP4 globals ride in "<...>._grouped_global_amax.gemmN" (container-only).
             import re as _re
 
+            block_by_gemm = {}
+            global_by_gemm = {}
             gemm_shards = {}
             for k in list(state_dict.keys()):
-                m = _re.search(r"(.*\._amax)\.gemm\d+$", k)
+                mg = _re.search(r"weight_quantizer\._grouped_global_amax\.gemm(\d+)$", k)
+                if mg:
+                    global_by_gemm[int(mg.group(1))] = state_dict[k]
+                    del state_dict[k]
+                    continue
+                m = _re.search(r"(.*\._amax)\.gemm(\d+)$", k)
                 if m:
                     gemm_shards.setdefault(m.group(1), []).append(k)
+                    if m.group(1).endswith("weight_quantizer._amax"):
+                        block_by_gemm[int(m.group(2))] = state_dict[k]
             for base_key, shard_keys in gemm_shards.items():
                 if base_key not in state_dict:
-                    state_dict[base_key] = state_dict[shard_keys[0]]
+                    # Keep the lowest-gemm shard as the shared quantizer buffer seed
+                    # (drop the prepended per-expert axis of size 1).
+                    shard_keys_sorted = sorted(
+                        shard_keys, key=lambda s: int(_re.search(r"gemm(\d+)$", s).group(1))
+                    )
+                    seed = state_dict[shard_keys_sorted[0]]
+                    state_dict[base_key] = seed.squeeze(0) if seed.dim() > 0 else seed
                 for k in shard_keys:
                     del state_dict[k]
+
+            self._rebuild_grouped_expert_scale_state(block_by_gemm, global_by_gemm)
             # _sharded_state_dict_grouped adds _extra_state{gemm_idx} for gemm_idx:[1, num_gemms] in
             # sharded_state_dict which is same as _extra_state. The _extra_state{gemm_idx} is used for
             # TE Fp8 checkpoint, we need to remove the _extra_state{gemm_idx} for gemm_idx:[1, num_gemms]
@@ -727,7 +747,6 @@ if HAS_TE:
                 self._grouped_block_amax_pending[k] = v
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-            from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
             from megatron.core.utils import get_pg_rank, get_pg_size
 
             # Collect static per-block amax stashed by _process_quantizer_amax during super().
@@ -738,18 +757,19 @@ if HAS_TE:
             if not pending:
                 return sharded_state_dict
 
-            # Give the per-rank shared block amax a unique global identity per local expert,
-            # mirroring how TEGroupedLinear stores weight{i} (singleton_local_shards / ep_axis).
-            # The amax buffer is shared across a rank's local experts, so every emitted expert
-            # shard is backed by the same buffer; on distcp load each global-expert key fills
-            # the shared buffer with the identical value. Preserves quantization math/bits.
+            from quant.methods.expert_scale_state import get_expert_scale_state
+
+            container = get_expert_scale_state(self)
+
+            # Emit per-expert scale state (DISTINCT block amax + NVFP4 global amax) with a unique
+            # global-expert identity per local expert, mirroring how TEGroupedLinear stores
+            # weight{i}. On distcp load each expert's slice is restored independently and the
+            # per-expert scale container (`_grouped_expert_scale_state_v1`) is rebuilt.
             meta = ensure_metadata_has_dp_cp_group(metadata)
-            singleton = bool((metadata or {}).get("singleton_local_shards", False))
             ep_group = self._pg_collection.ep
             num_gemms = self.num_gemms
             num_global_experts = get_pg_size(ep_group) * num_gemms
             local_expert_indices_offset = get_pg_rank(ep_group) * num_gemms
-            ep_axis = len(sharded_offsets)
             # Expert tensors are replicated across the *expert* data-parallel group (each expert
             # is owned by a single EP rank), so the owning rank must be the main replica. Use the
             # expert dp/tp groups from the module's parallel_state, mirroring how weight{i} shards.
@@ -761,30 +781,110 @@ if HAS_TE:
                     dp_cp_group = pstate.data_parallel_group.group
                 if getattr(pstate, "tensor_parallel_group", None) is not None:
                     tp_group = pstate.tensor_parallel_group.group
-            for k, v in pending.items():
+
+            def _emit_per_expert(logical_key, vals):
+                # Persist DISTINCT per-expert tensors by prepending a dedicated expert axis
+                # and sharding it as (axis0, global_expert_idx, num_global_experts). This gives
+                # each expert its own slice of a [num_global_experts, *shape] global array — the
+                # correct analogue of how weight{i} shards. (Sharding axis0 of the 2D block amax
+                # itself would map the expert axis onto the `out` data axis, collapsing distinct
+                # experts into last-write-wins.)
                 for gemm_idx in range(num_gemms):
                     global_expert_idx = local_expert_indices_offset + gemm_idx
-                    state = {f"{gemm_idx}.{k}": v}
-                    if singleton:
-                        expert_prefix = f"{global_expert_idx}.{prefix}"
-                        new_sharded_offsets = sharded_offsets
-                    else:
-                        expert_prefix = prefix
-                        new_sharded_offsets = (
-                            *sharded_offsets,
-                            (ep_axis, global_expert_idx, num_global_experts),
-                        )
+                    v_g = vals[gemm_idx].unsqueeze(0)  # [1, *shape]
+                    expert_axis = len(sharded_offsets)
+                    new_sharded_offsets = (
+                        *sharded_offsets,
+                        (expert_axis, global_expert_idx, num_global_experts),
+                    )
+                    state = {logical_key: v_g}
                     sub = make_sharded_tensors_for_checkpoint(
                         state,
-                        "",
+                        prefix,
                         {},
                         new_sharded_offsets,
                         tp_group=tp_group,
                         dp_cp_group=dp_cp_group,
                     )
-                    replace_prefix_for_sharding(sub, f"{gemm_idx}.", expert_prefix)
-                    sharded_state_dict[f"{prefix}{k}.gemm{gemm_idx}"] = sub[f"{gemm_idx}.{k}"]
+                    sharded_state_dict[f"{prefix}{logical_key}.gemm{gemm_idx}"] = sub[
+                        f"{prefix}{logical_key}"
+                    ]
+
+            for k, v in pending.items():
+                if k.endswith("weight_quantizer._amax") and container is not None:
+                    vals = [
+                        container.experts[g].block_amax.to(v.dtype).reshape(v.shape)
+                        for g in range(num_gemms)
+                    ]
+                else:
+                    # Distinct buffers per gemm — distcp loads in-place, so a shared tensor
+                    # object would make later experts overwrite earlier ones in memory.
+                    vals = [v.clone() for _ in range(num_gemms)]
+                _emit_per_expert(k, vals)
+
+            # Per-expert NVFP4 global amax (scalar). These differ per expert and cannot use
+            # the replicated numel==1 path; emit them with the same per-expert identity as the
+            # block amax. On the load side (fresh module, container=None) the pending gate still
+            # fires (static block amax was restored in phase 1), so the DEST requests these keys
+            # and _rebuild_grouped_expert_scale_state fills the container.
+            gkey = "weight_quantizer._grouped_global_amax"
+            _dev = next(iter(pending.values())).device
+            gvals = []
+            for gemm_idx in range(num_gemms):
+                if container is not None and container.experts[gemm_idx].global_amax is not None:
+                    gvals.append(container.experts[gemm_idx].global_amax.reshape(1).float())
+                else:
+                    gvals.append(torch.ones(1, dtype=torch.float32, device=_dev))
+            _emit_per_expert(gkey, gvals)
             return sharded_state_dict
+
+        def _rebuild_grouped_expert_scale_state(self, block_by_gemm, global_by_gemm):
+            """Rebuild the per-expert scale container from loaded distcp gemm shards.
+
+            ``block_by_gemm``/``global_by_gemm`` map gemm_idx -> tensor. Called from
+            ``_load_from_state_dict`` after the raw shards have been extracted. NVFP4 only;
+            MXFP4 grouped distcp persistence is not yet wired (dynamic quantizer has no
+            static block buffer to gate emission on).
+            """
+            if not block_by_gemm:
+                return
+            try:
+                from quant.methods.expert_scale_state import (
+                    ExpertScale,
+                    GroupedExpertScaleState,
+                    detect_format,
+                    set_expert_scale_state,
+                )
+            except Exception:
+                return
+            try:
+                fmt = detect_format(self.weight_quantizer)
+            except Exception:
+                fmt = "nvfp4"
+            if fmt != "nvfp4":
+                return
+            num_gemms = self.num_gemms
+            experts = []
+            weight_shapes = []
+            for g in range(num_gemms):
+                w = getattr(self, f"weight{g}", None)
+                if w is None or g not in block_by_gemm:
+                    return
+                out_features, in_features = int(w.shape[-2]), int(w.shape[-1])
+                weight_shapes.append((out_features, in_features))
+                block = block_by_gemm[g].detach().to(torch.float32).reshape(out_features, -1)
+                gval = global_by_gemm.get(g)
+                gval = gval.detach().to(torch.float32).reshape(1) if gval is not None else None
+                experts.append(ExpertScale(global_amax=gval, block_amax=block))
+            group_size = weight_shapes[0][1] // experts[0].block_amax.shape[-1]
+            state = GroupedExpertScaleState(
+                format="nvfp4",
+                num_gemms=num_gemms,
+                group_size=group_size,
+                weight_shapes=weight_shapes,
+                experts=experts,
+            )
+            set_expert_scale_state(self, state)
 
     @QuantModuleRegistry.register(
         {TEColumnParallelGroupedLinear: "megatron_TEColumnParallelGroupedLinear"}
