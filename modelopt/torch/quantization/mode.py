@@ -229,6 +229,7 @@ def wrapped_calib_func(
     layerwise = layerwise_cfg.get("enable", False)
     checkpoint_dir = layerwise_cfg.get("checkpoint_dir")
     qdq_from_prev = layerwise_cfg.get("get_qdq_activations_from_prev_layer", False)
+    maintain_fp_stream = layerwise_cfg.get("maintain_fp_upstream_stream", False)
     save_every = layerwise_cfg.get("save_every", 1)
     if method is not None and "awq" in method:
         # For backward compatibility
@@ -263,6 +264,7 @@ def wrapped_calib_func(
                 calib_func=func,
                 checkpoint_dir=checkpoint_dir,
                 get_qdq_activations_from_prev_layer=qdq_from_prev,
+                maintain_fp_upstream_stream=maintain_fp_stream,
                 save_every=save_every,
                 **kwargs,
             )

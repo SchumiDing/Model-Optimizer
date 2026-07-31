@@ -740,6 +740,17 @@ class LayerwiseConfig(ModeloptBaseConfig):
         ),
     )
 
+    maintain_fp_upstream_stream: bool = ModeloptField(
+        default=False,
+        title="Maintain a parallel FP-upstream activation stream (GPTAQ P-correction).",
+        description=(
+            "If True, capture each decoder layer's FP-upstream input once before "
+            "calibration mutates weights, and expose a per-layer FP forward loop so "
+            "GPTAQ can form the (x - x_bar) x_bar^T cross term from a genuine "
+            "FP-vs-QDQ upstream gap. Only meaningful for the gptaq/schur_gptaq modes."
+        ),
+    )
+
     checkpoint_dir: str | None = ModeloptField(
         default=None,
         title="Per-layer checkpoint directory (resume on restart).",

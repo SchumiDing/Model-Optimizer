@@ -34,6 +34,7 @@ from modelopt.torch.opt.searcher import ForwardLoop
 from modelopt.torch.quantization.utils.layerwise_calib import (
     LayerActivationCollector,
     _CheckpointState,
+    _move_to_device,
 )
 from modelopt.torch.utils import print_rank_0, warn_rank_0
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState
@@ -1902,6 +1903,56 @@ def svdquant(
 
 
 @torch.no_grad()
+def _capture_fp_upstream_layer_inputs(
+    model: nn.Module,
+    transformer_layers,
+    forward_loop: ForwardLoop,
+):
+    """Capture every decoder layer's *input* under the fully-FP model.
+
+    Runs a single full-model forward with all quantizers disabled and records,
+    per decoder layer, the ``(args, kwargs)`` seen at its ``__call__`` for each
+    calibration batch (offloaded to CPU). These are the GPTAQ ``x`` (FP-upstream)
+    activations: independent of quantization, they only need to be captured once
+    before layerwise calibration mutates upstream weights in place.
+
+    The batch order matches ``forward_loop`` exactly, so the i-th captured input
+    for a layer pairs one-to-one with the i-th QDQ-upstream input the layerwise
+    harness later replays for that same layer.
+    """
+    cpu = torch.device("cpu")
+    captured: dict[int, list] = {i: [] for i in range(len(transformer_layers))}
+    handles = []
+
+    def _make_hook(idx):
+        def _hook(module, args, kwargs):
+            captured[idx].append(
+                (_move_to_device(args, cpu), _move_to_device(kwargs, cpu))
+            )
+            return None
+
+        return _hook
+
+    for i, layer in enumerate(transformer_layers):
+        handles.append(layer.register_forward_pre_hook(_make_hook(i), with_kwargs=True))
+    try:
+        with set_quantizer_by_cfg_context(
+            model, [{"quantizer_name": "*", "enable": False}]
+        ):
+            forward_loop(model)
+    finally:
+        for h in handles:
+            h.remove()
+
+    n0 = len(captured.get(0, []))
+    print_rank_0(
+        f"GPTAQ dual-stream: captured FP-upstream inputs for {len(captured)} layers "
+        f"({n0} batches/layer)."
+    )
+    return captured
+
+
+@torch.no_grad()
 def layerwise_calibrate(
     model: nn.Module,
     forward_loop: ForwardLoop,
@@ -1925,6 +1976,7 @@ def layerwise_calibrate(
     """
     checkpoint_dir = calib_kwargs.pop("checkpoint_dir", None)
     qdq_from_prev = calib_kwargs.pop("get_qdq_activations_from_prev_layer", False)
+    maintain_fp_stream = calib_kwargs.pop("maintain_fp_upstream_stream", False)
     save_every = calib_kwargs.pop("save_every", 1)
 
     if forward_loop is None:
@@ -1952,6 +2004,15 @@ def layerwise_calibrate(
 
     input_getter = LayerActivationCollector(model)
     input_getter._patch_all_layers(decoder_layers=transformer_layers)
+
+    # Capture FP-upstream layer inputs up front (before calibration mutates any
+    # upstream weights in place). Needed so GPTAQ can form the (x - x_bar) x_bar^T
+    # cross term from a genuine FP-vs-QDQ upstream gap.
+    fp_inputs_by_idx = None
+    if maintain_fp_stream:
+        fp_inputs_by_idx = _capture_fp_upstream_layer_inputs(
+            model, transformer_layers, forward_loop
+        )
 
     resumed_inputs = ckpt.setup_resume(transformer_layers) if ckpt and start_layer > 0 else None
 
@@ -1982,6 +2043,26 @@ def layerwise_calibrate(
                         else:
                             kwargs_input["past_key_values"] = None
                     m(*args, **kwargs_input)
+
+            if fp_inputs_by_idx is not None:
+
+                def _fp_layer_forward_loop(m, _fp_inputs=fp_inputs_by_idx.get(layer_idx, [])):
+                    dev = next(m.parameters()).device
+                    for args, kwargs_input in _fp_inputs:
+                        args = _move_to_device(args, dev)
+                        kwargs_input = _move_to_device(kwargs_input, dev)
+                        if (
+                            "past_key_values" in kwargs_input
+                            and kwargs_input["past_key_values"] is not None
+                        ):
+                            cache = kwargs_input["past_key_values"]
+                            if hasattr(cache, "reset"):
+                                cache.reset()
+                            else:
+                                kwargs_input["past_key_values"] = None
+                        m(*args, **kwargs_input)
+
+                _layer_forward_loop.fp_forward_loop = _fp_layer_forward_loop
 
             is_last = layer_idx + 1 >= num_layers
 
@@ -2016,6 +2097,8 @@ def layerwise_calibrate(
                     ckpt.save(layer_idx, model, transformer_layers, next_inputs)
 
             del layer_inputs
+            if fp_inputs_by_idx is not None:
+                fp_inputs_by_idx.pop(layer_idx, None)
             torch.cuda.empty_cache()
             layer_inputs = next_inputs  # noqa: F841 (used in next iteration's closure)
     finally:
