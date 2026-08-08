@@ -77,6 +77,12 @@ def update_hessian(input, hessian, n_samples):
     return hessian, n_samples
 
 
+# How many 10x damping escalations compute_hessian_inverse may try before it
+# gives up and returns the identity matrix. 5 spans perc_damp 1% -> 100x mean
+# diagonal, far past anything a real calibration Hessian needs.
+_MAX_DAMP_ESCALATIONS = 5
+
+
 def compute_hessian_inverse(hessian, weight, perc_damp):
     """Compute damped upper-Cholesky inverse Hessian.
 
@@ -101,16 +107,53 @@ def compute_hessian_inverse(hessian, weight, perc_damp):
     h[:, zero_cols] = 0
     h[zero_cols, zero_cols] = 1
 
-    damp = perc_damp * torch.mean(torch.diag(h))
+    mean_diag = torch.mean(torch.diag(h))
     diag_indices = torch.arange(h.shape[0], device=h.device)
-    h[diag_indices, diag_indices] += damp
 
-    try:
-        h = torch.cholesky_inverse(torch.linalg.cholesky(h))
-        return torch.linalg.cholesky(h, upper=True)
-    except (RuntimeError, torch.linalg.LinAlgError):
-        print_rank_0("Warning: Hessian is not positive definite, using identity matrix")
-        return torch.eye(h.shape[0], device=h.device, dtype=h.dtype)
+    # Escalating damping.
+    #
+    # Falling straight back to the identity matrix is NOT a benign degradation:
+    # the caller keeps diffusing quantization error using H^-1 = I, i.e. with
+    # entirely wrong inter-column couplings, which is materially worse than not
+    # running error correction at all. Observed impact: this fired on every
+    # Llama-3.1-8B W4A16 identity-transform run, for every algorithm, on
+    # linear_qkv and linear_fc1 -- fc1 landed at 1.2e-2 relative MSE against
+    # 1.4e-4 for the neighbouring fc2, and inflated end-to-end relative MSE to
+    # ~4x that of plain RTN.
+    #
+    # A Hessian that fails Cholesky at 1% damping essentially always factorises
+    # at 10%, so raise the damping until it does and report the level used. The
+    # identity fallback is kept only as a last resort and is now logged as an
+    # ERROR, because any layer reaching it has an invalid solve.
+    applied = 0.0
+    for attempt in range(_MAX_DAMP_ESCALATIONS):
+        target = float(perc_damp) * (10.0**attempt) * float(mean_diag)
+        h[diag_indices, diag_indices] += target - applied
+        applied = target
+        try:
+            h_inv = torch.cholesky_inverse(torch.linalg.cholesky(h))
+            upper = torch.linalg.cholesky(h_inv, upper=True)
+        except (RuntimeError, torch.linalg.LinAlgError):
+            continue
+        # A "successful" factorisation can still carry non-finite entries; those
+        # would silently poison the solve, so treat them as a failure too.
+        if not torch.isfinite(upper).all():
+            continue
+        if attempt:
+            print_rank_0(
+                f"Warning: Hessian required {10.0**attempt:g}x damping to "
+                f"factorise (perc_damp {perc_damp:g} -> "
+                f"{perc_damp * 10.0**attempt:g})"
+            )
+        return upper
+
+    print_rank_0(
+        "ERROR: Hessian not positive definite even at "
+        f"{perc_damp * 10.0 ** (_MAX_DAMP_ESCALATIONS - 1):g} damping; falling "
+        "back to the identity matrix -- this layer's solve is INVALID and any "
+        "result derived from it must be discarded"
+    )
+    return torch.eye(h.shape[0], device=h.device, dtype=h.dtype)
 
 
 class GPTQHelper:

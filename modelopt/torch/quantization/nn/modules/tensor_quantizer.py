@@ -210,6 +210,16 @@ class TensorQuantizer(nn.Module):
 
         self._use_constant_amax = False
         self._constant_amax = None
+        # `set_from_attribute_config` iterates `attribute_cfg.items()`, so a bare dict
+        # only ever assigns the keys it happens to contain -- every omitted field's
+        # `_<name>` attribute is then never created and the first property to read one
+        # raises a misleading `AttributeError` naming the property rather than the
+        # missing attribute (e.g. `is_mx_format` reading `_block_sizes`, or
+        # `__repr__` reading `_disabled`). A `QuantizerAttributeConfig` iterates ALL
+        # model fields, which is why it does not hit this. Seed the full defaults, then
+        # let the caller's config apply as a partial override.
+        if isinstance(quant_attribute_cfg, dict):
+            self.set_from_attribute_config(QuantizerAttributeConfig())
         self.set_from_attribute_config(quant_attribute_cfg)
 
         self._if_quant = if_quant

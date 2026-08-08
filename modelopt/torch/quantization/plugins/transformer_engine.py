@@ -15,6 +15,7 @@
 
 """Support quantization for Transformer Engine layers."""
 
+import copy
 import inspect
 import warnings
 
@@ -142,6 +143,99 @@ class _QuantTEGroupedLinear(_ParallelLinear):
         # applied per gemm in `te_grouped_quantized_linear_fn` and persisted as a
         # stacked buffer through the Megatron distcp hooks.
 
+    # ------------------------------------------------------------------ #
+    # Per-expert weight quantizers (opt-in)
+    # ------------------------------------------------------------------ #
+    # ModelOpt's object model gives a module ONE weight_quantizer, but a TE
+    # GroupedLinear holds weight0..weight{num_gemms-1}. The historical workaround
+    # (`_grouped_expert_scale_state_v1` + install/restore around each gemm in
+    # `te_grouped_quantized_linear_fn`) TIME-MULTIPLEXES one shared quantizer:
+    # expert j's scales are written into it, the gemm runs, then the state is
+    # restored. That is sound for PTQ and for frozen-buffer inference, but it
+    # cannot support a *learnable* scale (LSQ):
+    #
+    #   * a single leaf tensor would receive the summed gradient of every expert,
+    #   * the optimizer would see 1 parameter instead of num_gemms,
+    #   * the `finally: restore_quantizer_scale_state(...)` would clobber the LSQ
+    #     state on every forward,
+    #   * and `install_nvfp4_scale_state` writes `_amax`, which LSQ no longer reads
+    #     (it reads `_amax_post` / `_amax_pre`) -- so all experts would silently
+    #     share one expert's scales.
+    #
+    # NVFP4 itself is per-tensor here: the format says each weight matrix gets its
+    # own per-block scales plus its own per-tensor global scale, which is exactly
+    # what the artifact stores per expert. Only the plumbing was shared. This gives
+    # each expert a real quantizer so scales become first-class per-expert state.
+    #
+    # Opt-in on purpose: unless `enable_per_expert_weight_quantizers()` is called,
+    # `weight_quantizers` does not exist and every path below behaves exactly as
+    # before (no state_dict change, no numerical change).
+    def enable_per_expert_weight_quantizers(
+        self, lsq: bool = False, seed_from_state: bool = True, **lsq_kwargs
+    ) -> int:
+        """Give each grouped weight its OWN weight quantizer.
+
+        Args:
+            lsq: also call ``enable_lsq(**lsq_kwargs)`` on each per-expert quantizer,
+                making its per-block amax a learnable ``nn.Parameter`` initialized
+                from that expert's calibrated scales.
+            seed_from_state: seed each quantizer from the per-expert scale container
+                (``_grouped_expert_scale_state_v1``) when one is attached, so the
+                per-expert quantizers start bit-identical to the PTQ result.
+            **lsq_kwargs: forwarded to ``StaticBlockScaleQuantizer.enable_lsq``.
+
+        Returns:
+            Number of per-expert quantizers installed.
+        """
+        if getattr(self, "weight_quantizers", None) is not None:
+            raise RuntimeError(
+                "per-expert weight quantizers are already installed on this module; "
+                "calling this twice would discard the current (possibly trained) scales."
+            )
+        num_gemms = int(self.num_gemms)
+        state = getattr(self, "_grouped_expert_scale_state_v1", None) if seed_from_state else None
+        if state is not None and len(state.experts) != num_gemms:
+            raise ValueError(
+                f"per-expert scale container has {len(state.experts)} experts but "
+                f"num_gemms={num_gemms}."
+            )
+
+        quantizers = []
+        for i in range(num_gemms):
+            weight_i = getattr(self, f"weight{i}", None)
+            if weight_i is None:
+                raise RuntimeError(f"weight{i} is missing; cannot build a per-expert quantizer.")
+            q = copy.deepcopy(self.weight_quantizer)
+            if state is not None:
+                # Reuse the project's canonical installer rather than duplicating the
+                # promote/amax-reshape logic, so the two cannot drift apart.
+                from quant.methods.expert_scale_state import install_expert_scale_state
+
+                install_expert_scale_state(q, weight_i.data.float(), state.experts[i], state.format)
+            quantizers.append(q)
+
+        self.weight_quantizers = torch.nn.ModuleList(quantizers)
+        if lsq:
+            for i, q in enumerate(self.weight_quantizers):
+                if not hasattr(q, "enable_lsq"):
+                    raise TypeError(
+                        f"expert {i}: {type(q).__name__} has no enable_lsq; per-expert LSQ "
+                        "needs a StaticBlockScaleQuantizer (seed_from_state promotes it)."
+                    )
+                q.enable_lsq(**lsq_kwargs)
+        return len(self.weight_quantizers)
+
+    def per_expert_weight_quantizers(self):
+        """Return the per-expert quantizer list, or ``None`` when not enabled."""
+        qs = getattr(self, "weight_quantizers", None)
+        if qs is None:
+            return None
+        if len(qs) != int(self.num_gemms):
+            raise RuntimeError(
+                f"weight_quantizers has {len(qs)} entries but num_gemms={self.num_gemms}."
+            )
+        return qs
+
     def modelopt_post_restore(self, prefix: str = ""):
         # GroupedMLP stores the weights as weight0, weight1, etc. To run post_restore in order to
         # initialize the quantizer states, self.weight is used to extract shape, dtype etc. Assigning
@@ -154,10 +248,85 @@ class _QuantTEGroupedLinear(_ParallelLinear):
 
     def iter_weights_for_calibration(self):
         """Yield ``(weight_i, weight_quantizer)`` for each of the ``num_gemms`` grouped weights."""
+        per_expert = self.per_expert_weight_quantizers()
         for i in range(self.num_gemms):
             weight_i = getattr(self, f"weight{i}", None)
             if weight_i is not None:
-                yield weight_i, self.weight_quantizer
+                yield weight_i, (self.weight_quantizer if per_expert is None else per_expert[i])
+
+    def capture_per_expert_scale_state(self):
+        """Write the per-expert quantizers' current scales back into the container.
+
+        Needed after LSQ training: the trained scales live in each quantizer's
+        ``_amax_post`` parameter, while export reads the
+        ``_grouped_expert_scale_state_v1`` container.
+        """
+        per_expert = self.per_expert_weight_quantizers()
+        if per_expert is None:
+            raise RuntimeError(
+                "per-expert weight quantizers are not enabled; nothing to capture."
+            )
+        state = getattr(self, "_grouped_expert_scale_state_v1", None)
+        if state is None:
+            raise RuntimeError(
+                "no per-expert scale container on this module to capture into."
+            )
+        from quant.methods.expert_scale_state import capture_expert_scale_state
+
+        for i, q in enumerate(per_expert):
+            out_features = getattr(self, f"weight{i}").shape[0]
+            captured = capture_expert_scale_state(
+                q, state.format, out_features, n_samples=state.experts[i].n_samples
+            )
+            state.experts[i] = captured
+        state.validate()
+        return state
+
+    def _quantize_grouped_weights(self, args, new_args, weights_start, num_gemms):
+        """Fake-quantize the ``num_gemms`` grouped weights in ``args`` into ``new_args``.
+
+        Dispatch, in order of preference:
+
+        1. per-expert quantizers (``enable_per_expert_weight_quantizers``) -- each
+           expert owns its block scales and global scale as real module state, so they
+           can be ``nn.Parameter``s under LSQ with independent gradients.
+        2. shared quantizer + per-expert scale container, time-multiplexed. Valid only
+           while scales are frozen buffers (PTQ / inference); a learnable scale cannot
+           be time-multiplexed, so LSQ is rejected here.
+        3. plain shared quantizer (non-MoE, or no per-expert scales calibrated).
+        """
+        per_expert = self.per_expert_weight_quantizers()
+        state = getattr(self, "_grouped_expert_scale_state_v1", None)
+        if per_expert is not None:
+            for j, i in enumerate(range(weights_start, weights_start + num_gemms)):
+                new_args[i] = per_expert[j](args[i])
+            return
+        if state is None:
+            for i in range(weights_start, weights_start + num_gemms):
+                new_args[i] = self.weight_quantizer(args[i])
+            return
+        if getattr(self.weight_quantizer, "_lsq", False):
+            raise RuntimeError(
+                "The shared weight_quantizer has LSQ enabled while per-expert scales are "
+                "installed. Time-multiplexing a learnable scale across experts is invalid: "
+                "it is a single leaf tensor, so every expert would use one expert's scale "
+                "and accumulate one summed gradient. Call "
+                "`enable_per_expert_weight_quantizers(lsq=True, ...)` on this module "
+                "instead of `weight_quantizer.enable_lsq(...)`."
+            )
+        from quant.methods.expert_scale_state import (
+            fake_quant_expert_weight,
+            restore_quantizer_scale_state,
+            snapshot_quantizer_scale_state,
+        )
+
+        q = self.weight_quantizer
+        snap = snapshot_quantizer_scale_state(q)
+        try:
+            for j, i in enumerate(range(weights_start, weights_start + num_gemms)):
+                new_args[i] = fake_quant_expert_weight(q, args[i], state.experts[j], state.format)
+        finally:
+            restore_quantizer_scale_state(q, snap)
 
     @staticmethod
     def te_grouped_quantized_linear_fn(package, func_name, self, *args):
@@ -186,27 +355,7 @@ class _QuantTEGroupedLinear(_ParallelLinear):
 
         new_args = list(args)
         new_args[inp_pos] = self.input_quantizer(args[inp_pos])
-        # Per-expert scale isolation: if a per-expert scale container is present
-        # (MoE grouped linear), quantize each weight{i} with ITS OWN scale rather
-        # than a single shared scale. Falls back to the shared quantizer otherwise.
-        state = getattr(self, "_grouped_expert_scale_state_v1", None)
-        if state is None:
-            for i in range(weights_start, weights_start + num_gemms):
-                new_args[i] = self.weight_quantizer(args[i])
-        else:
-            from quant.methods.expert_scale_state import (
-                snapshot_quantizer_scale_state,
-                restore_quantizer_scale_state,
-                fake_quant_expert_weight,
-            )
-
-            q = self.weight_quantizer
-            snap = snapshot_quantizer_scale_state(q)
-            try:
-                for j, i in enumerate(range(weights_start, weights_start + num_gemms)):
-                    new_args[i] = fake_quant_expert_weight(q, args[i], state.experts[j], state.format)
-            finally:
-                restore_quantizer_scale_state(q, snap)
+        self._quantize_grouped_weights(args, new_args, weights_start, num_gemms)
         output = getattr(package, func_name)(*new_args)
         # TE 2.15+ returns `(out, new_workspaces)`; TE <= 2.14 returns just `out`.
         # Only the activation tensor participates in output quantization.

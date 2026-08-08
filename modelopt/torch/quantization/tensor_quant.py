@@ -645,21 +645,75 @@ def _tensor_quant(inputs, amax, num_bits=8, unsigned=False, narrow_range=True):
     return outputs
 
 
+def _fp4_e2m1_round_reference(x: torch.Tensor, out_dtype=None) -> torch.Tensor:
+    """Device-agnostic E2M1 round-to-nearest-even, mirroring the Triton kernel.
+
+    This is a line-by-line mirror of ``static_blockwise_fp4_cast_kernel`` in
+    ``modelopt/torch/kernels/quantization/gemm/fp4_kernel.py``: identical
+    thresholds, identical alternation of ``<=`` / ``<`` (which is what implements
+    ties-to-even on the E2M1 grid 0, 0.5, 1, 1.5, 2, 3, 4, 6), identical
+    saturation of everything above 5.0 to 6.0, and the same ``x >= 0`` sign rule.
+    Kept as a nested ``where`` chain rather than a ``bucketize`` so that the
+    correspondence to the kernel stays reviewable.
+
+    Needed because the Triton kernel is CUDA-only, which makes the whole LSQ path
+    (``StaticBlockScaleQuantizer._fake_quantize`` -> ``_cast_ste``) unusable on CPU
+    and therefore untestable off a Blackwell node.
+    """
+    if out_dtype is None:
+        out_dtype = x.dtype
+    # Autograd is off inside a custom Function.forward, and the STE gradient is
+    # supplied by backward(), so no graph needs to be built here.
+    a = x.float().abs()
+    q = torch.where(
+        a <= 0.25,
+        torch.zeros_like(a),
+        torch.where(
+            a < 0.75,
+            torch.full_like(a, 0.5),
+            torch.where(
+                a <= 1.25,
+                torch.ones_like(a),
+                torch.where(
+                    a < 1.75,
+                    torch.full_like(a, 1.5),
+                    torch.where(
+                        a <= 2.5,
+                        torch.full_like(a, 2.0),
+                        torch.where(
+                            a < 3.5,
+                            torch.full_like(a, 3.0),
+                            torch.where(
+                                a <= 5.0, torch.full_like(a, 4.0), torch.full_like(a, 6.0)
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return torch.where(x.float() >= 0, q, -q).to(out_dtype)
+
+
 class FP4CastSTEFunction(Function):
     """FP4 cast with STE backward -- no scale/descale, just rounding."""
 
     @staticmethod
     def forward(ctx, x, out_dtype=None):
-        """Forward pass: cast to FP4 using triton kernel.
+        """Forward pass: cast to FP4.
+
+        Uses the Triton kernel when it is available and the tensor is on CUDA, and
+        falls back to the bit-identical reference implementation otherwise so that
+        LSQ works on CPU (and on any non-Triton device).
 
         Args:
             x: Input tensor of shape [NUM_BLOCKS, BLOCK_SIZE].
             out_dtype: Output dtype. Defaults to x.dtype.
         """
-        if not triton_kernel.IS_AVAILABLE:
-            raise RuntimeError("FP4CastSTEFunction requires triton.")
         ctx.save_for_backward(x)
-        return triton_kernel.static_blockwise_fp4_cast(x, out_dtype)
+        if triton_kernel.IS_AVAILABLE and x.is_cuda:
+            return triton_kernel.static_blockwise_fp4_cast(x, out_dtype)
+        return _fp4_e2m1_round_reference(x, out_dtype)
 
     @staticmethod
     def backward(ctx, grad_outputs):
